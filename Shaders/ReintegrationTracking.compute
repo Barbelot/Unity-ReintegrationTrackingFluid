@@ -1,0 +1,357 @@
+// Taken from https://www.shadertoy.com/view/WtfyDj
+
+#define NUMTHREADS 8
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Init
+#pragma kernel UpdateBufferA
+#pragma kernel UpdateBufferB
+#pragma kernel UpdateBufferC
+#pragma kernel UpdateOutput
+
+#include "ReintegrationTrackingCommon.cginc"
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> _BufferA;
+RWTexture2D<float4> _BufferB;
+RWTexture2D<float4> _BufferC;
+RWTexture2D<float4> _Output;
+
+Texture2D<float4> _Obstacles;
+
+SamplerState linearClampSampler;
+
+float4 _Resolution;
+float _Time;
+float _Dt;
+float _Mass;
+float _FluidRho;
+float _Diffusion;
+float4 _Gravity;
+
+struct Emitter
+{
+    float emitterType;
+    float2 position;
+    float fluidRadius;
+    float fluidColor;
+    float velocityRadius;
+    float2 velocityDirection;
+    float velocityStrength;
+};
+
+RWStructuredBuffer<Emitter> _EmittersBuffer;
+int _EmittersCount;
+
+/***********************************************************************
+************************ FUNCTIONS *************************************
+***********************************************************************/
+
+void ApplySettings()
+{
+    R = _Resolution.xy;
+    time = _Time;
+    dt = _Dt;
+    mass = _Mass;
+    fluid_rho = _FluidRho;
+    dif = _Diffusion;
+    gravity = _Gravity.xy;
+    //vortex = _Gravity.w;
+    //Mouse = iMouse;
+}
+
+//force calculation and integration
+void Simulation(RWTexture2D<float4> ch, inout particle P, float2 pos)
+{
+    //Compute the SPH force
+    float2 F = float2(.0, .0);
+    float3 avgV = float3(.0, .0, .0);
+    range(i, -2, 2)range(j, -2, 2)
+        {
+            float2 tpos = pos + float2(i, j);
+            float4 data = texel(ch, tpos);
+            particle P0 = getParticle(data, tpos);
+            float2 dx = P0.X - P.X;
+            float avgP = 0.5 * P0.M.x * (Pf(P.M) + Pf(P0.M));
+            F -= 0.5 * G(1. * dx) * avgP * dx;
+            avgV += P0.M.x * G(1. * dx) * float3(P0.V, 1.);
+        }
+    avgV.xy /= avgV.z;
+
+    //viscosity
+    F += 0. * P.M.x * (avgV.xy - P.V);
+    
+    //gravity
+    F += P.M.x * gravity;
+
+    //Mouse
+    //if (Mouse.z > 0.)
+    //{
+    //    float2 dm = (Mouse.xy - Mouse.zw * float2(1.0, -1.0)) / 10.;
+    //    float d = distance(Mouse.xy, P.X) / 20.;
+    //    F += 0.001 * dm * exp(-d * d);
+    //   // P.M.y += 0.1*exp(-40.*d*d);
+    //}
+    
+    //integrate
+    P.V += F * dt / P.M.x;
+
+    ////border 
+    //float3 N = bN(P.X);
+    //float vdotN = step(N.z, border_h) * dot(-N.xy, P.V);
+    //P.V += 0.5 * (N.xy * vdotN + N.xy * abs(vdotN));
+    //P.V += 0. * P.M.x * N.xy * step(abs(N.z), border_h) * exp(-N.z);
+    
+    //if (N.z < 0.)
+    //    P.V = float2(.0, .0);
+    
+    ////Center obstacle
+    //if (length(P.X - R * .5f) < 50.0f)
+    //{
+    //    P.V = float2(.0, .0);
+    //}
+    
+    //Obstacles
+    //float4 obstacle = _Obstacles.SampleLevel(linearClampSampler, P.X / R, 0);
+    //if (obstacle.x > .5f)
+    //{
+    //    P.V = float2(.0, .0);
+    //}
+    
+    //Circle obstacle
+    float2 dirToCenter = R * .5f - P.X;
+    float distToCenter = length(dirToCenter);
+    float strToCenter = smoothstep(R.y * .48f, R.y * .49f, distToCenter);
+    dirToCenter = normalize(dirToCenter);
+    P.V += dirToCenter * strToCenter;
+    
+    //Vortex
+    //float2 vortexDir = float2(dirToCenter.y, -dirToCenter.x);
+    //float vortexStrength = smoothstep(R.y * .35f, R.y * .48f, distToCenter);
+    //P.V += vortexDir * vortexStrength * vortex;
+    
+    //velocity limit
+    float v = length(P.V);
+    P.V /= (v > 1.) ? v : 1.;
+}
+
+float4 V(float2 p)
+{
+    return texel(_BufferC, p);
+}
+
+float segment(float2 PP, float2 AA, float2 BB, float rr)
+{
+    float2 gg = BB - AA;
+    float2 hh = PP - AA;
+    float dd = length(hh - gg * clamp(dot(gg, hh) / dot(gg, gg), 0.0, 1.0));
+    return smoothstep(rr, 0.5 * rr, dd);
+}
+
+/***********************************************************************
+************************ KERNELS ***************************************
+***********************************************************************/
+
+[numthreads(NUMTHREADS, NUMTHREADS, 1)]
+void Init (uint3 id : SV_DispatchThreadID)
+{
+    uint2 pos = id.xy;
+    
+    ApplySettings();
+    
+    particle P;
+    
+    //Initialize A (particles to random values)
+    float3 rand = hash32(pos);
+    if (rand.z < 0.)
+    {
+        P.X = pos;
+        P.V = 0.5 * (rand.xy - 0.5) + float2(0., 0.);
+        P.M = float2(mass, 0.);
+    }
+    else
+    {
+        P.X = pos;
+        P.V = float2(0., .0);
+        P.M = float2(1e-6, 1e-6);
+    }
+    
+    _BufferA[pos] = saveParticle(P, pos);
+    
+    //Initialize B, C, and Output to zero
+    _BufferB[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+    _BufferC[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+    _Output[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+}
+
+[numthreads(NUMTHREADS, NUMTHREADS, 1)]
+void UpdateBufferA(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pos = id.xy;
+    
+    ApplySettings();
+    
+    uint2 p = pos;
+
+    float4 data = texel(_BufferB, pos);
+    
+    particle P; // = getParticle(data, pos);
+       
+    Reintegration(_BufferB, P, pos);
+    
+    _BufferA[pos] = saveParticle(P, pos);
+}
+
+[numthreads(NUMTHREADS, NUMTHREADS, 1)]
+void UpdateBufferB(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pos = id.xy;
+    
+    ApplySettings();
+    
+    uint2 p = pos;
+    
+    float4 data = texel(_BufferA, pos);
+    
+    particle P = getParticle(data, pos);
+    
+    if (P.M.x != 0.) //not vacuum
+    {
+        Simulation(_BufferA, P, pos);
+    }
+    
+    /*
+    if (length(P.X - R * float2(0.8, 0.9)) < 10.)
+    {
+        P.X = pos;
+        P.V = 0.5 * Dir(-PI * 0.25 - PI * 0.5 + 0.3 * sin(0.4 * time));
+        P.M = lerp(P.M, float2(fluid_rho, 1.), 0.4);
+    }
+
+    if (length(P.X - R * float2(0.2, 0.9)) < 10.)
+    {
+        P.X = pos;
+        P.V = 0.5 * Dir(-PI * 0.25 + 0.3 * sin(0.3 * time));
+        P.M = lerp(P.M, float2(fluid_rho, 0.), 0.4);
+    }
+    */
+    
+    for (int i = 0; i < _EmittersCount; i++)
+    {
+        Emitter emitter = _EmittersBuffer[i];
+        float2 dir = P.X - R * emitter.position;
+        float dist = length(dir);
+        
+        if (dist < emitter.fluidRadius)
+        {
+            P.X = pos;
+            
+            P.M = lerp(P.M, float2(fluid_rho, emitter.fluidColor), 0.4);
+        }
+        
+        if (dist < emitter.velocityRadius)
+        {
+            P.X = pos;
+            
+            if (emitter.emitterType == 0) //Directional
+            {
+                P.V += emitter.velocityDirection * emitter.velocityStrength * smoothstep(emitter.velocityRadius, 0, dist);
+            }
+            else if (emitter.emitterType == 1) //Spherical
+            {
+                P.V += emitter.velocityStrength * normalize(dir) * smoothstep(emitter.velocityRadius, 0, dist);
+            }
+            
+        }
+    }
+    
+    _BufferB[pos] = saveParticle(P, pos);
+}
+
+[numthreads(NUMTHREADS, NUMTHREADS, 1)]
+void UpdateBufferC(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pos = id.xy;
+    
+    ApplySettings();
+    
+    uint2 p = pos;
+
+    float4 data = texel(_BufferA, pos);
+    particle P = getParticle(data, pos);
+    
+    //particle render
+    float4 rho = float4(.0, .0, .0, .0);
+    range(i, -1, 1)range(j, -1, 1)
+        {
+            float2 ij = float2(i, j);
+            float4 data = texel(_BufferA, pos + ij);
+            particle P0 = getParticle(data, pos + ij);
+
+            float2 x0 = P0.X; //update position
+            //how much mass falls into this pixel
+            rho += 1. * float4(P.V, P.M) * G((pos - x0) / 0.75);
+        }
+    
+    _BufferC[pos] = rho;
+}
+
+[numthreads(NUMTHREADS, NUMTHREADS, 1)]
+void UpdateOutput(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pos = id.xy;
+    
+    ApplySettings();
+    
+    //pos = R*0.5 + pos*0.1;
+    uint2 p = pos;
+    
+    float4 data = texel(_BufferA, pos);
+    particle P = getParticle(data, pos);
+    
+    //border render
+    //float3 Nb = bN(P.X);
+    //float bord = smoothstep(2. * border_h, border_h * 0.5, border(pos));
+    
+    //Obstacles
+    //float4 obstacle = _Obstacles.SampleLevel(linearClampSampler, P.X / R, 0);
+    //float bord = obstacle.x;
+    
+    //Circle
+    float2 dirToCenter = R * .5f - pos;
+    float distToCenter = length(dirToCenter);
+    float bord = smoothstep(R.y * .48f, R.y * .48f, distToCenter);
+    
+    float4 rho = V(pos);
+    float3 dx = float3(-2., 0., 2.);
+    float4 grad = -0.5 * float4(V(pos + dx.zy).zw - V(pos + dx.xy).zw,
+                         V(pos + dx.yz).zw - V(pos + dx.yx).zw);
+    float2 N = pow(length(grad.xz), 0.2) * normalize(grad.xz + 1e-5);
+    float specular = pow(max(dot(N, Dir(1.4)), 0.), 3.5);
+    //float specularb = G(0.4 * (Nb.zz - border_h)) * pow(max(dot(Nb.xy, Dir(1.4)), 0.), 3.);
+    
+    float a = pow(smoothstep(fluid_rho * 0., fluid_rho * 2., rho.z), 0.1);
+    float b = exp(-1.7 * smoothstep(fluid_rho * 1., fluid_rho * 7.5, rho.z));
+    float3 col0 = 1.0f - float3(50.0/255., 128./255., 104./255.);
+    float3 col1 = 1.0f - float3(50.0 / 255., 128. / 255., 104. / 255.);
+    float3 fcol = mixN(col0, col1, tanh(3. * (rho.w - 0.7)) * 0.5 + 0.5);
+    // Output to screen
+    float4 col = float4(3., 3., 3. , 1);
+    col.xyz = mixN(col.xyz, fcol.xyz * (1.5 * b + specular * 5.), a);
+    col.xyz = mixN(col.xyz, 0. * float3(0.5, 0.5, 1.), bord);
+    col.xyz = tanh(col.xyz);
+    
+    //Debug gravity
+    //col = lerp(col, float4(1, 0, 0, 1), segment((pos * 2 - R) / R.y, float2(0., 0.), gravity * 1000, .01));
+    
+    if (bord == 1)
+    {
+        col = float4(1, 1, 1, 1);
+    }
+    
+    _Output[pos] = 1.0f - col;
+}
+
+
+
